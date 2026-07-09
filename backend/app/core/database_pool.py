@@ -25,7 +25,11 @@ class DatabasePool:
         self.session_factory = None
 
     async def initialize(self):
-        """Initialize database connection pool"""
+        """Initialize database connection pool (idempotent)."""
+        if self.session_factory is not None:
+            # Already initialized — reuse the engine/pool. Re-creating it on every
+            # request would leak a new async engine + connection pool each time.
+            return
         try:
             # Build the async engine from the configured database_url.
             # (Previously this was assembled from settings.supabase_db_* keys that
