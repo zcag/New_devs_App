@@ -1,25 +1,42 @@
 import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import QueuePool
 import logging
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _async_dsn(url: str) -> str:
+    """Return the configured database URL using the asyncpg driver."""
+    # settings.database_url is the single source of truth for the DB connection
+    # (and is what docker-compose provides). Normalize it to the async driver.
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return url
+
+
 class DatabasePool:
     def __init__(self):
         self.engine = None
         self.session_factory = None
-        
+
     async def initialize(self):
         """Initialize database connection pool"""
         try:
-            # Create async engine with connection pooling
-            database_url = f"postgresql+asyncpg://{settings.supabase_db_user}:{settings.supabase_db_password}@{settings.supabase_db_host}:{settings.supabase_db_port}/{settings.supabase_db_name}"
-            
+            # Build the async engine from the configured database_url.
+            # (Previously this was assembled from settings.supabase_db_* keys that
+            # do not exist on Settings, so the engine never initialized and the
+            # revenue service silently fell back to hard-coded mock data.)
+            database_url = _async_dsn(settings.database_url)
+
             self.engine = create_async_engine(
                 database_url,
-                poolclass=QueuePool,
+                # NB: async engines manage their own async-compatible pool; passing
+                # the sync QueuePool here would raise. Keep the standard tuning.
                 pool_size=20,  # Number of connections to maintain
                 max_overflow=30,  # Additional connections when needed
                 pool_pre_ping=True,  # Validate connections
@@ -45,8 +62,14 @@ class DatabasePool:
         if self.engine:
             await self.engine.dispose()
     
-    async def get_session(self) -> AsyncSession:
-        """Get database session from pool"""
+    def get_session(self) -> AsyncSession:
+        """Get a database session from the pool.
+
+        Returns the AsyncSession directly (it is itself an async context
+        manager) so callers can use ``async with db_pool.get_session()``.
+        Declaring this ``async`` would return a coroutine instead, which does
+        not support the async-context-manager protocol.
+        """
         if not self.session_factory:
             raise Exception("Database pool not initialized")
         return self.session_factory()
