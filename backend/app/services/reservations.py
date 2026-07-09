@@ -1,35 +1,63 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
 
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
+def month_bounds_utc(year: int, month: int, tz_name: str) -> Tuple[datetime, datetime]:
+    """UTC ``[start, end)`` instants bounding ``month`` in the property's LOCAL timezone.
+
+    Revenue is reported per local calendar month, so the month boundaries must be
+    anchored in the property's timezone and then converted to UTC for comparison
+    against ``check_in_date`` (a timestamptz stored in UTC).
+
+    The previous implementation built *naive* boundaries (``datetime(year, month, 1)``)
+    and compared them against tz-aware timestamps — effectively bucketing by UTC and
+    ignoring each property's timezone. That mis-files bookings near a month edge:
+    e.g. a Europe/Paris check-in at ``2024-02-29 23:30 UTC`` is ``2024-03-01 00:30``
+    local, i.e. **March** revenue, but naive-UTC bucketing drops it into February —
+    exactly the "March totals don't match" report.
+    """
+    tz = ZoneInfo(tz_name or "UTC")
+    start_local = datetime(year, month, 1, tzinfo=tz)
+    if month == 12:
+        end_local = datetime(year + 1, 1, 1, tzinfo=tz)
     else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+        end_local = datetime(year, month + 1, 1, tzinfo=tz)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
-    """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int) -> Decimal:
+    """Revenue for ``property_id`` in the given local-calendar month (tenant-scoped)."""
+    from app.core.database_pool import db_pool
+    from sqlalchemy import text
+
+    await db_pool.initialize()
+    async with db_pool.get_session() as session:
+        # The property's own timezone determines what "this month" means.
+        tz_row = (await session.execute(
+            text("SELECT timezone FROM properties WHERE id = :property_id AND tenant_id = :tenant_id"),
+            {"property_id": property_id, "tenant_id": tenant_id},
+        )).fetchone()
+        tz_name = tz_row.timezone if tz_row else "UTC"
+
+        start_utc, end_utc = month_bounds_utc(year, month, tz_name)
+
+        row = (await session.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(total_amount), 0) AS total
+                FROM reservations
+                WHERE property_id = :property_id
+                  AND tenant_id = :tenant_id
+                  AND check_in_date >= :start_utc
+                  AND check_in_date < :end_utc
+                """
+            ),
+            {"property_id": property_id, "tenant_id": tenant_id, "start_utc": start_utc, "end_utc": end_utc},
+        )).fetchone()
+
+        return Decimal(str(row.total))
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
