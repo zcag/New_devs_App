@@ -25,7 +25,9 @@ of their real **$2250/4**. (A second latent defect: `get_session` was `async def
 `async with db_pool.get_session()` received a coroutine.)
 **Fix.** Build the engine from the configured `settings.database_url` (async driver), drop the
 sync `QueuePool` (invalid on an async engine), and make `get_session` return the session directly.
-Real, tenant-scoped SQL now runs. `database_pool.py`.
+Real, tenant-scoped SQL now runs. Also made `initialize()` idempotent and switched
+`calculate_total_revenue` to the shared pool — it previously built a fresh engine per request
+(connection leak). `database_pool.py`, `reservations.py`.
 
 ## Bug 2 — Cross-tenant revenue leak via the cache  → *Client B: "another company's numbers on refresh"*
 **Root cause.** `services/cache.py` keyed the Redis entry on `revenue:{property_id}` only. Because
